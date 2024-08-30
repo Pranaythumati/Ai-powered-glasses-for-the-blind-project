@@ -1,0 +1,259 @@
+import cv2
+import os
+import numpy as np
+import pytesseract
+from picamera2 import Picamera2
+import pyttsx3  # For text-to-speech functionality
+
+# Initialize the text-to-speech engine
+engine = pyttsx3.init()
+engine.setProperty('rate', 150)  # Set speech rate (lower is slower)
+
+# Load Haar Cascades for face and eyes detection
+face_cascade = cv2.CascadeClassifier('/home/pi/robot/haarcascade_frontalface_alt2.xml')
+eye_cascade = cv2.CascadeClassifier('/home/pi/robot/haarcascade_eye.xml')
+
+# Load the LBPH face recognizer
+recognizer = cv2.face.LBPHFaceRecognizer_create()
+
+# Load YOLOv3-tiny for object detection
+net = cv2.dnn.readNet('yolov3-tiny.weights', 'yolov3-tiny.cfg')
+classes = []
+with open("coco.names", "r") as f:
+    classes = f.read().splitlines()
+
+# Function to capture images for face training
+def capture_images(name, img_count=300):
+    output_dir = "Faces/" + name
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    picam2 = Picamera2()
+    camera_config = picam2.create_still_configuration(main={"size": (512, 304)})
+    picam2.configure(camera_config)
+    picam2.start()
+
+    img_counter = 0
+    try:
+        while img_counter < img_count:
+            frame = picam2.capture_array()
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+            faces = face_cascade.detectMultiScale(gray, scaleFactor=1.3, minNeighbors=5)
+            for (x, y, w, h) in faces:
+                face_roi = gray[y:y+h, x:x+w]
+                eyes = eye_cascade.detectMultiScale(face_roi)
+                if len(eyes) >= 2:
+                    cv2.rectangle(frame, (x, y), (x+w, y+h), (255, 0, 0), 2)
+                    img_name = os.path.join(output_dir, "image_{}.jpg".format(img_counter))
+                    cv2.imwrite(img_name, face_roi)
+                    img_counter += 1
+                    message = "{} written!".format(img_name)
+                    print(message)
+                    engine.say(message)  # Speak the message
+                    engine.runAndWait()
+
+            cv2.imshow("Press Space to take a photo", frame)
+            k = cv2.waitKey(1)
+            if k % 256 == 27:  # ESC key to exit
+                break
+            elif k % 256 == 32:  # Space key to capture image
+                if len(faces) > 0 and len(eyes) >= 2:
+                    img_name = os.path.join(output_dir, "image_{}.jpg".format(img_counter))
+                    cv2.imwrite(img_name, frame)
+                    img_counter += 1
+                    message = "{} written!".format(img_name)
+                    print(message)
+                    engine.say(message)  # Speak the message
+                    engine.runAndWait()
+    finally:
+        picam2.stop()
+        picam2.close()
+        cv2.destroyAllWindows()
+
+# Function to train faces
+def train_faces():
+    faces_dir = 'Faces/'
+    faces = []
+    labels = []
+    label_mapping = {}
+    label_count = 0
+
+    for person_name in os.listdir(faces_dir):
+        person_dir = os.path.join(faces_dir, person_name)
+        if os.path.isdir(person_dir):
+            label_mapping[label_count] = person_name
+            for image_file in os.listdir(person_dir):
+                if image_file.endswith('.jpg') or image_file.endswith('.png'):
+                    image_path = os.path.join(person_dir, image_file)
+                    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+                    faces.append(img)
+                    labels.append(label_count)
+            label_count += 1
+
+    if len(faces) > 0 and len(labels) > 0:
+        recognizer.train(faces, np.array(labels))
+        recognizer.save('trained_faces.xml')
+        message = "Training completed."
+        print(message)
+        engine.say(message)  # Speak the message
+        engine.runAndWait()
+    else:
+        message = "No faces found for training."
+        print(message)
+        engine.say(message)  # Speak the message
+        engine.runAndWait()
+
+    return label_mapping
+
+# Function to recognize faces and objects
+def recognize_faces_and_objects(label_mapping):
+    picam2 = Picamera2()
+    camera_config = picam2.create_still_configuration(main={"size": (320, 240)})
+    picam2.configure(camera_config)
+    picam2.start()
+
+    label_name = {value: key for key, value in label_mapping.items()}
+
+    try:
+        while True:
+            frame = picam2.capture_array()
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+            # Detect faces
+            faces = face_cascade.detectMultiScale(gray, scaleFactor=1.3, minNeighbors=5)
+
+            # Face recognition
+            for (x, y, w, h) in faces:
+                roi_gray = gray[y:y+h, x:x+w]
+                eyes = eye_cascade.detectMultiScale(roi_gray)
+                if len(eyes) >= 2:
+                    label, confidence = recognizer.predict(roi_gray)
+                    if confidence < 100:
+                        name = label_mapping.get(label, "Unknown")
+                    else:
+                        name = "Unknown"
+
+                    cv2.rectangle(frame, (x, y), (x+w, y+h), (255, 0, 0), 2)
+                    cv2.putText(frame, name, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+
+                    if name == "Unknown":
+                        message = "Unknown person is recognized"
+                    else:
+                        message = f"{name} is recognized"
+                    print(message)
+                    engine.say(message)  # Speak the message
+                    engine.runAndWait()
+
+            # Object detection
+            height, width, _ = frame.shape
+            blob = cv2.dnn.blobFromImage(frame, 1 / 255.0, (320, 320), swapRB=True, crop=False)
+            net.setInput(blob)
+            output_layers_names = net.getUnconnectedOutLayersNames()
+            layerOutputs = net.forward(output_layers_names)
+
+            boxes = []
+            confidences = []
+            class_ids = []
+
+            for output in layerOutputs:
+                for detection in output:
+                    scores = detection[5:]
+                    class_id = np.argmax(scores)
+                    confidence = scores[class_id]
+                    if confidence > 0.5:
+                        center_x = int(detection[0] * width)
+                        center_y = int(detection[1] * height)
+                        w = int(detection[2] * width)
+                        h = int(detection[3] * height)
+
+                        x = int(center_x - w / 2)
+                        y = int(center_y - h / 2)
+
+                        boxes.append([x, y, w, h])
+                        confidences.append(float(confidence))
+                        class_ids.append(class_id)
+
+            indexes = cv2.dnn.NMSBoxes(boxes, confidences, 0.5, 0.4)
+
+            if len(indexes) > 0:
+                for i in indexes.flatten():
+                    x, y, w, h = boxes[i]
+                    label = str(classes[class_ids[i]])
+                    color = (0, 255, 0)  # Green color for boxes
+                    cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+                    cv2.putText(frame, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+
+                    message = f"{label} is identified"
+                    print(message)
+                    engine.say(message)  # Speak the message
+                    engine.runAndWait()
+
+            cv2.imshow("Face and Object Recognition", frame)
+
+            key = cv2.waitKey(1)
+            if key == 27:  # ESC key
+                break
+    finally:
+        picam2.stop()
+        picam2.close()
+        cv2.destroyAllWindows()
+
+# Function to extract text from live camera feed
+def extract_text_from_camera():
+    picam2 = Picamera2()
+    camera_config = picam2.create_still_configuration(main={"size": (640, 480)})
+    picam2.configure(camera_config)
+    picam2.start()
+
+    cv2.namedWindow("Text Detection", cv2.WINDOW_NORMAL)
+
+    try:
+        while True:
+            # Capture frame-by-frame
+            image = picam2.capture_array()
+            frame = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)  # Convert from RGB to BGR
+
+            cv2.imshow("Text Detection", frame)
+            key = cv2.waitKey(1) & 0xFF
+            if key == 32:  # Space key to detect text
+                text = pytesseract.image_to_string(frame)
+                if text:
+                    print("Detected text:")
+                    print(text)
+                    engine.say(f"Detected text is: {text}")  # Speak out detected text
+                    engine.runAndWait()
+                else:
+                    print("No text detected")
+
+            elif key == 27:  # ESC key to break
+                break
+    finally:
+        picam2.stop()
+        cv2.destroyAllWindows()
+
+# Main function to run the complete system
+def main():
+    label_mapping = {}
+    while True:
+        print("1. Train new faces")
+        print("2. Recognize faces and objects")
+        print("3. Extract text from live camera")
+        print("4. Exit")
+        choice = input("Enter your choice: ")
+
+        if choice == '1':
+            label_mapping = train_faces()
+        elif choice == '2':
+            recognize_faces_and_objects(label_mapping)
+        elif choice == '3':
+            extract_text_from_camera()
+        elif choice == '4':
+            break
+        else:
+            print("Invalid choice. Please try again.")
+
+if __name__ == "__main__":
+    main()
