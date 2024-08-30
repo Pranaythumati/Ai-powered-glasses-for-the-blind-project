@@ -1,0 +1,153 @@
+import cv2
+import os
+import numpy as np
+from picamera2 import Picamera2
+
+# Load Haar Cascades for face and eyes detection
+face_cascade = cv2.CascadeClassifier('/home/pi/robot/haarcascade_frontalface_alt2.xml')
+eye_cascade = cv2.CascadeClassifier('/home/pi/robot/haarcascade_eye.xml')
+
+# Load the LBPH face recognizer
+recognizer = cv2.face.LBPHFaceRecognizer_create()
+
+def capture_images(name, img_count=300):
+    output_dir = "Faces/" + name
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    picam2 = Picamera2()
+    camera_config = picam2.create_still_configuration(main={"size": (512, 304)})
+    picam2.configure(camera_config)
+    picam2.start()
+
+    img_counter = 0
+    try:
+        while img_counter < img_count:
+            frame = picam2.capture_array()
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+            faces = face_cascade.detectMultiScale(gray, scaleFactor=1.3, minNeighbors=5)
+            for (x, y, w, h) in faces:
+                face_roi = gray[y:y+h, x:x+w]
+                eyes = eye_cascade.detectMultiScale(face_roi)
+                if len(eyes) >= 2:
+                    cv2.rectangle(frame, (x, y), (x+w, y+h), (255, 0, 0), 2)
+                    img_name = os.path.join(output_dir, "image_{}.jpg".format(img_counter))
+                    cv2.imwrite(img_name, face_roi)
+                    img_counter += 1
+                    print("{} written!".format(img_name))
+
+            cv2.imshow("Press Space to take a photo", frame)
+
+            k = cv2.waitKey(1)
+            if k % 256 == 27:  # ESC key to exit
+                break
+            elif k % 256 == 32:  # Space key to capture image
+                if len(faces) > 0 and len(eyes) >= 2:
+                    img_name = os.path.join(output_dir, "image_{}.jpg".format(img_counter))
+                    cv2.imwrite(img_name, frame)
+                    img_counter += 1
+                    print("{} written!".format(img_name))
+    finally:
+        picam2.stop()
+        picam2.close()
+        cv2.destroyAllWindows()
+
+def train_faces():
+    faces_dir = 'Faces/'
+    faces = []
+    labels = []
+    label_mapping = {}
+    label_count = 0
+
+    for person_name in os.listdir(faces_dir):
+        person_dir = os.path.join(faces_dir, person_name)
+        if os.path.isdir(person_dir):
+            label_mapping[label_count] = person_name
+            for image_file in os.listdir(person_dir):
+                if image_file.endswith('.jpg') or image_file.endswith('.png'):
+                    image_path = os.path.join(person_dir, image_file)
+                    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+                    faces.append(img)
+                    labels.append(label_count)
+            label_count += 1
+
+    if len(faces) > 0 and len(labels) > 0:
+        recognizer.train(faces, np.array(labels))
+        recognizer.save('trained_faces.xml')
+        print("Training completed.")
+    else:
+        print("No faces found for training.")
+
+    return label_mapping
+
+def recognize_faces(label_mapping):
+    label_name = {value: key for key, value in label_mapping.items()}
+
+    picam2 = Picamera2()
+    camera_config = picam2.create_still_configuration(main={"size": (320, 240)})
+    picam2.configure(camera_config)
+    picam2.start()
+
+    try:
+        while True:
+            frame = picam2.capture_array()
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+            # Detect faces
+            faces = face_cascade.detectMultiScale(gray, scaleFactor=1.3, minNeighbors=5)
+
+            # Face recognition
+            for (x, y, w, h) in faces:
+                roi_gray = gray[y:y+h, x:x+w]
+                eyes = eye_cascade.detectMultiScale(roi_gray)
+                if len(eyes) >= 2:
+                    label, confidence = recognizer.predict(roi_gray)
+                    if confidence < 100:
+                        name = label_mapping.get(label, "Unknown")
+                    else:
+                        name = "Unknown"
+                    
+                    cv2.rectangle(frame, (x, y), (x+w, y+h), (255, 0, 0), 2)
+                    cv2.putText(frame, name, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+
+            cv2.imshow("Face Recognition", frame)
+            
+            k = cv2.waitKey(1)
+            if k % 256 == 27:  # ESC key
+                break
+    finally:
+        picam2.stop()
+        picam2.close()
+        print("Camera stopped.")
+        cv2.destroyAllWindows()
+
+def main():
+    choice = input("Do you want to train new faces? (y/n): ").lower()
+
+    if choice == 'y':
+        delete_existing = input("Do you want to delete existing trained data? (y/n): ").lower()
+        if delete_existing == 'y':
+            if os.path.exists("trained_faces.xml"):
+                os.remove("trained_faces.xml")
+
+        num_faces = int(input("How many faces do you want to train? "))
+        for i in range(num_faces):
+            name = input(f"Enter the name of person {i + 1}: ")
+            capture_images(name)
+
+        label_mapping = train_faces()
+        recognize_faces(label_mapping)
+    
+    elif choice == 'n':
+        if os.path.exists("trained_faces.xml"):
+            recognizer.read("trained_faces.xml")
+            label_mapping = train_faces()  # Get the label mapping even if not training
+            recognize_faces(label_mapping)
+        else:
+            print("No trained data found. Please train new faces first.")
+
+if __name__ == "__main__":
+    main()
